@@ -346,6 +346,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "wheels": msg.get("wheels", []),
                     "health": msg.get("health", 0),
                     "fuel": msg.get("fuel", 0),
+                    "vehicle_index": msg.get("vehicle_index", 0),
                 }
 
                 await room_broadcast(
