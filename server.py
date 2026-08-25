@@ -33,6 +33,8 @@ class Player:
     fuel_used: float = 0.0
     max_horizontal_speed: float = 0.0
     damage_taken: float = 0.0
+    eliminated: bool = False
+    elimination_reason: str = ""
     collected_fuel: Set[str] = field(default_factory=set)
 
 
@@ -45,6 +47,7 @@ class Room:
     race_started: bool = False
     race_start_server_time: Optional[float] = None
     finish_count: int = 0
+    race_over: bool = False
 
 
 rooms: Dict[str, Room] = {}
@@ -84,14 +87,112 @@ def room_state(room: Room):
                 "nickname": p.nickname,
                 "ready": p.ready,
                 "finished": p.finished,
+                "eliminated": p.eliminated,
+                "elimination_reason": p.elimination_reason,
             }
             for p in room.players.values()
         ],
     }
 
 
+
+def reset_player_race_state(player: Player, ready=False):
+    player.ready = ready
+    player.finished = False
+    player.finish_order = None
+    player.finish_time = None
+    player.fuel_used = 0.0
+    player.max_horizontal_speed = 0.0
+    player.damage_taken = 0.0
+    player.eliminated = False
+    player.elimination_reason = ""
+    player.collected_fuel.clear()
+
+
+def player_result(player: Player):
+    return {
+        "player_id": player.player_id,
+        "nickname": player.nickname,
+        "finished": player.finished,
+        "eliminated": player.eliminated,
+        "elimination_reason": player.elimination_reason,
+        "finish_order": player.finish_order,
+        "finish_time": player.finish_time,
+        "fuel_used": player.fuel_used,
+        "max_horizontal_speed": player.max_horizontal_speed,
+        "damage_taken": player.damage_taken,
+    }
+
+
+async def finalize_race(room: Room, winner_id=None, reason="finished"):
+    if room.race_over:
+        return
+
+    room.race_over = True
+    room.race_started = False
+
+    players = list(room.players.values())
+
+    # Finished players first, then survivors, then eliminated players.
+    players.sort(
+        key=lambda p: (
+            0 if p.finished else (1 if not p.eliminated else 2),
+            p.finish_order if p.finish_order is not None else 999,
+        )
+    )
+
+    await room_broadcast(room, {
+        "type": "race_results",
+        "winner": winner_id,
+        "reason": reason,
+        "players": [player_result(p) for p in players],
+    })
+
+
+async def maybe_finish_race(room: Room):
+    if room.race_over or not room.players:
+        return
+
+    players = list(room.players.values())
+    finished = [p for p in players if p.finished]
+    eliminated = [p for p in players if p.eliminated]
+    active = [
+        p for p in players
+        if not p.finished and not p.eliminated
+    ]
+
+    # Everybody reached a terminal state.
+    if not active:
+        if finished:
+            winner = min(
+                finished,
+                key=lambda p: p.finish_order or 999,
+            )
+            await finalize_race(
+                room,
+                winner.player_id,
+                "finish",
+            )
+        else:
+            await finalize_race(
+                room,
+                None,
+                "all_eliminated",
+            )
+        return
+
+    # If nobody has finished and only one racer is still alive/running,
+    # that player wins by survival.
+    if len(active) == 1 and not finished and len(eliminated) >= 1:
+        await finalize_race(
+            room,
+            active[0].player_id,
+            "last_running",
+        )
+
+
 async def maybe_start_countdown(room: Room):
-    if room.race_started:
+    if room.race_started or room.race_over:
         return
 
     if len(room.players) != MAX_PLAYERS:
@@ -131,14 +232,12 @@ async def leave_room(room: Room, player_id: str):
         room.host_id = next(iter(room.players))
 
     room.race_started = False
+    room.race_over = False
     room.race_start_server_time = None
     room.finish_count = 0
 
     for p in room.players.values():
-        p.ready = False
-        p.finished = False
-        p.finish_order = None
-        p.finish_time = None
+        reset_player_race_state(p, ready=False)
 
     await room_broadcast(room, {
         "type": "player_left",
@@ -347,7 +446,30 @@ async def websocket_endpoint(ws: WebSocket):
                     "health": msg.get("health", 0),
                     "fuel": msg.get("fuel", 0),
                     "vehicle_index": msg.get("vehicle_index", 0),
+                    "rpm": msg.get("rpm", 0),
+                    "throttle": msg.get("throttle", 0),
+                    "stalled": msg.get("stalled", False),
+                    "dead": msg.get("dead", False),
                 }
+
+                player.fuel_used = max(
+                    player.fuel_used,
+                    float(msg.get("fuel_used", player.fuel_used)),
+                )
+                player.max_horizontal_speed = max(
+                    player.max_horizontal_speed,
+                    float(msg.get(
+                        "max_horizontal_speed",
+                        player.max_horizontal_speed,
+                    )),
+                )
+                player.damage_taken = max(
+                    player.damage_taken,
+                    float(msg.get(
+                        "damage_taken",
+                        player.damage_taken,
+                    )),
+                )
 
                 await room_broadcast(
                     room,
@@ -375,7 +497,7 @@ async def websocket_endpoint(ws: WebSocket):
             # Finish
             # ---------------------------------------------------------
             elif msg_type == "finish":
-                if player.finished:
+                if player.finished or player.eliminated or room.race_over:
                     continue
 
                 player.finished = True
@@ -418,30 +540,101 @@ async def websocket_endpoint(ws: WebSocket):
                     "finish_time": player.finish_time,
                 })
 
-                if all(p.finished for p in room.players.values()):
-                    ordered = sorted(
-                        room.players.values(),
-                        key=lambda p: p.finish_order or 999,
-                    )
+                await maybe_finish_race(room)
 
-                    results = {
-                        "type": "race_results",
-                        "winner": ordered[0].player_id,
-                        "players": [
-                            {
-                                "player_id": p.player_id,
-                                "nickname": p.nickname,
-                                "finish_order": p.finish_order,
-                                "finish_time": p.finish_time,
-                                "fuel_used": p.fuel_used,
-                                "max_horizontal_speed": p.max_horizontal_speed,
-                                "damage_taken": p.damage_taken,
-                            }
-                            for p in ordered
-                        ],
-                    }
+            # ---------------------------------------------------------
+            # Elimination: destroyed or irrecoverably out of fuel
+            # ---------------------------------------------------------
+            elif msg_type == "eliminated":
+                if (
+                    player.finished
+                    or player.eliminated
+                    or room.race_over
+                ):
+                    continue
 
-                    await room_broadcast(room, results)
+                player.eliminated = True
+                player.elimination_reason = str(
+                    msg.get("reason", "eliminated")
+                )[:40]
+
+                player.fuel_used = max(
+                    player.fuel_used,
+                    float(msg.get("fuel_used", 0)),
+                )
+                player.max_horizontal_speed = max(
+                    player.max_horizontal_speed,
+                    float(msg.get("max_horizontal_speed", 0)),
+                )
+                player.damage_taken = max(
+                    player.damage_taken,
+                    float(msg.get("damage_taken", 0)),
+                )
+
+                await room_broadcast(room, {
+                    "type": "player_eliminated",
+                    "player_id": player.player_id,
+                    "nickname": player.nickname,
+                    "reason": player.elimination_reason,
+                })
+
+                await maybe_finish_race(room)
+
+            # ---------------------------------------------------------
+            # Results -> same map rematch (host only)
+            # ---------------------------------------------------------
+            elif msg_type == "restart_race":
+                if room.host_id != player.player_id:
+                    await send_json(ws, {
+                        "type": "error",
+                        "message": "Only host can restart the race",
+                    })
+                    continue
+
+                if len(room.players) != MAX_PLAYERS:
+                    continue
+
+                room.race_started = False
+                room.race_over = False
+                room.race_start_server_time = None
+                room.finish_count = 0
+
+                for p in room.players.values():
+                    reset_player_race_state(p, ready=True)
+
+                await room_broadcast(room, {
+                    "type": "race_reset",
+                    "mode": "restart",
+                    "level": room.level,
+                })
+                await room_broadcast(room, room_state(room))
+                await maybe_start_countdown(room)
+
+            # ---------------------------------------------------------
+            # Results -> lobby/map selection (host only)
+            # ---------------------------------------------------------
+            elif msg_type == "choose_map":
+                if room.host_id != player.player_id:
+                    await send_json(ws, {
+                        "type": "error",
+                        "message": "Only host can choose another map",
+                    })
+                    continue
+
+                room.race_started = False
+                room.race_over = False
+                room.race_start_server_time = None
+                room.finish_count = 0
+
+                for p in room.players.values():
+                    reset_player_race_state(p, ready=False)
+
+                await room_broadcast(room, {
+                    "type": "race_reset",
+                    "mode": "lobby",
+                    "level": room.level,
+                })
+                await room_broadcast(room, room_state(room))
 
             # ---------------------------------------------------------
             # Leave
