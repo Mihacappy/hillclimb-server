@@ -181,14 +181,6 @@ async def maybe_finish_race(room: Room):
             )
         return
 
-    # If nobody has finished and only one racer is still alive/running,
-    # that player wins by survival.
-    if len(active) == 1 and not finished and len(eliminated) >= 1:
-        await finalize_race(
-            room,
-            active[0].player_id,
-            "last_running",
-        )
 
 
 async def maybe_start_countdown(room: Room):
