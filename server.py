@@ -486,6 +486,24 @@ async def websocket_endpoint(ws: WebSocket):
                 })
 
             # ---------------------------------------------------------
+            # Discrete vehicle audio event relay
+            # ---------------------------------------------------------
+            elif msg_type == "audio_event":
+                await room_broadcast(
+                    room,
+                    {
+                        "type": "audio_event",
+                        "player_id": player.player_id,
+                        "event": str(msg.get("event", ""))[:32],
+                        "vehicle_index": int(msg.get("vehicle_index", 0)),
+                        "x": float(msg.get("x", 0)),
+                        "y": float(msg.get("y", 0)),
+                        "strength": float(msg.get("strength", 1.0)),
+                    },
+                    exclude_id=player.player_id,
+                )
+
+            # ---------------------------------------------------------
             # Finish
             # ---------------------------------------------------------
             elif msg_type == "finish":
